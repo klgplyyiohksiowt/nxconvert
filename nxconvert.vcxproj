@@ -106,7 +106,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)mbedtls\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -122,7 +122,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -287,12 +287,16 @@
     <ClInclude Include="mbedtls\include\mbedtls\x509_crt.h" />
     <ClInclude Include="mbedtls\include\mbedtls\x509_csr.h" />
     <ClInclude Include="mbedtls\include\mbedtls\xtea.h" />
+    <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="mbedtls\library\CMakeLists.txt" />
   </ItemGroup>
   <ItemGroup>
     <None Include="mbedtls\library\Makefile" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="resource.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
