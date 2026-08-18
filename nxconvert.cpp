@@ -19,11 +19,17 @@
 #include <commctrl.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
+#include <mutex>
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Ole32.lib")
+
+HANDLE g_rom_file = INVALID_HANDLE_VALUE;
+HANDLE g_rom_mapping = nullptr;
+uint8_t* g_rom_data = nullptr;
+uint64_t g_rom_size = 0;
 
 void ShowError(HWND hwnd, const std::string& message);
 void LogMessage(HWND hwnd, const std::string& message);
@@ -162,6 +168,28 @@ struct DecryptProgress
 
 static DecryptProgress g_decrypt_progress;
 static std::atomic<bool> g_cancel_decrypt = false;
+
+bool read_at(
+    uint64_t offset,
+    void* buffer,
+    size_t size
+)
+{
+    if (!g_rom_data)
+        return false;
+
+    if (offset + size > g_rom_size)
+        return false;
+
+
+    memcpy(
+        buffer,
+        g_rom_data + offset,
+        size
+    );
+
+    return true;
+}
 
 // Define CHUNK_SIZE as 1MB (0x100000 bytes)
 const size_t CHUNK_SIZE = 0x1000000;
@@ -779,7 +807,6 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
 
 void decrypt_aes_ctr_section(
     HWND hwnd,
-    std::ifstream& fin,
     std::fstream& fout,
     uint64_t nca_offset,
     const NcaHeader& nca_header,
@@ -821,10 +848,7 @@ void decrypt_aes_ctr_section(
             enc.resize(chunk);
         }
 
-        fin.seekg(abs_offset + offset_in_section, std::ios::beg);
-        fin.read(reinterpret_cast<char*>(enc.data()), chunk);
-
-        if (size_t(fin.gcount()) != chunk) {
+        if (!read_at(abs_offset + offset_in_section, reinterpret_cast<char*>(enc.data()), chunk)) {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Short read while decrypting RomFS\n");
             std::exit(1);
         }
@@ -845,14 +869,16 @@ void decrypt_aes_ctr_section(
             return;
         }
         g_decrypt_progress.current_partition_bytes += chunk;
-        int percent = static_cast<int>(
-            ((g_decrypt_progress.processed_bytes + g_decrypt_progress.current_partition_bytes) * 100) /
-            g_decrypt_progress.total_bytes);
-        SendMessage(
-            progress,
-            PBM_SETPOS,
-            percent,
-            0);
+        if (g_decrypt_progress.total_bytes) {
+            int percent = static_cast<int>(
+                ((g_decrypt_progress.processed_bytes + g_decrypt_progress.current_partition_bytes) * 100) /
+                g_decrypt_progress.total_bytes);
+            SendMessage(
+                progress,
+                PBM_SETPOS,
+                percent,
+                0);
+        }
     }
 
     LogMessage(hwnd, StrBuilder{} << "        [*] RomFS AES-CTR decryption complete\n");
@@ -906,7 +932,6 @@ void ctr_ex_crypt_buffer(
 
 void ctr_ex_crypt(
     HWND hwnd,
-    std::istream & in,
     std::ostream & out,
     uint64_t physical_offset,          // where encrypted data lives in NCA
     uint64_t size,                     // bytes to process
@@ -932,13 +957,21 @@ void ctr_ex_crypt(
 
     uint64_t processed = 0;
 
-    in.seekg(physical_offset);
     out.seekp(physical_offset);
+
+    uint64_t readpos = physical_offset;
 
     while (processed < size)
     {
         size_t chunk = std::min<uint64_t>(BUF_SIZE, size - processed);
-        in.read(reinterpret_cast<char*>(buf.data()), chunk);
+        if (!read_at(
+            readpos,
+            buf.data(),
+            chunk))
+        {
+            throw std::runtime_error("CTR-EX read failed");
+        }
+        readpos += chunk;
 
         for (size_t i = 0; i < chunk; i += 16)
         {
@@ -989,7 +1022,6 @@ struct CtrExSubsection {
 };
 
 std::vector<CtrExSubsection> process_ctr_ex_table(
-    std::istream& fin,
     std::ostream& fout,
     uint64_t table_phys,
     uint64_t table_size,
@@ -1001,8 +1033,7 @@ std::vector<CtrExSubsection> process_ctr_ex_table(
 
     // Read the entire encrypted table
     std::vector<uint8_t> data(table_size);
-    fin.seekg(table_phys);
-    fin.read(reinterpret_cast<char*>(data.data()), table_size);
+    read_at(table_phys, reinterpret_cast<char*>(data.data()), table_size);
 
     std::array<uint8_t, 4> secure4;
     std::copy_n(section.SecureValue.begin(), 4, secure4.begin());
@@ -1056,7 +1087,6 @@ std::vector<CtrExSubsection> process_ctr_ex_table(
 
 void decrypt_aes_ctr_ex_section(
     HWND hwnd,
-    std::ifstream& fin,
     std::fstream& fout,
     uint64_t nca_offset,
     const NcaHeader& nca_header,
@@ -1086,7 +1116,6 @@ void decrypt_aes_ctr_ex_section(
     {
         ctr_ex_crypt(
             hwnd,
-            fin,
             fout,
             physical_base,
             fs_size,
@@ -1107,9 +1136,7 @@ void decrypt_aes_ctr_ex_section(
         uint64_t ctr_ex_size = patch.aes_ctr_ex_size;
 
         std::vector<uint8_t> ctr_ex_data(ctr_ex_size);
-        fin.seekg(physical_base + ctr_ex_offset);
-        fin.read(reinterpret_cast<char*>(ctr_ex_data.data()), ctr_ex_size);
-        if (static_cast<uint64_t>(fin.gcount()) != ctr_ex_size)
+        if (!read_at(physical_base + ctr_ex_offset, reinterpret_cast<char*>(ctr_ex_data.data()), ctr_ex_size))
             throw std::runtime_error("CTR-EX table short read");
 
         std::array<uint8_t, 4> secure4;
@@ -1141,9 +1168,7 @@ void decrypt_aes_ctr_ex_section(
         uint64_t indirect_size = patch.indirect_size;
 
         std::vector<uint8_t> indirect_data(indirect_size);
-        fin.seekg(physical_base + indirect_offset);
-        fin.read(reinterpret_cast<char*>(indirect_data.data()), indirect_size);
-        if (static_cast<uint64_t>(fin.gcount()) != indirect_size)
+        if (!read_at(physical_base + indirect_offset, reinterpret_cast<char*>(indirect_data.data()), indirect_size))
             throw std::runtime_error("Indirect table short read");
 
         std::array<uint8_t, 4> secure4;
@@ -1172,7 +1197,6 @@ void decrypt_aes_ctr_ex_section(
     uint64_t table_phys = physical_base + patch.aes_ctr_ex_offset;
 
     auto subs = process_ctr_ex_table(
-        fin,
         fout,
         table_phys,
         patch.aes_ctr_ex_size,
@@ -1198,7 +1222,6 @@ void decrypt_aes_ctr_ex_section(
 
         ctr_ex_crypt(
             hwnd,
-            fin,
             fout,
             physical_base + s.offset,
             region_size,
@@ -1212,7 +1235,6 @@ void decrypt_aes_ctr_ex_section(
 
 void decrypt_romfs(
     HWND hwnd,
-    std::ifstream& fin,
     std::fstream& fout,
     uint64_t nca_offset,
     const NcaHeader& nca_header,
@@ -1230,7 +1252,6 @@ void decrypt_romfs(
     case 3: // AesCtr
         decrypt_aes_ctr_section(
             hwnd,
-            fin,
             fout,
             nca_offset,
             nca_header,
@@ -1243,7 +1264,6 @@ void decrypt_romfs(
     case 4: // AesCtrEx
         decrypt_aes_ctr_ex_section(
             hwnd,
-            fin,
             fout,
             nca_offset,
             nca_header,
@@ -1261,7 +1281,6 @@ void decrypt_romfs(
 
 void decrypt_pfs0_file_inplace(
     HWND hwnd,
-    std::ifstream& fin,
     std::fstream& fout,
     const std::string& name,
     uint64_t file_offset,
@@ -1302,12 +1321,9 @@ void decrypt_pfs0_file_inplace(
         uint64_t aligned_ctr = target_ctr - prefix;
 
         // --- read aligned encrypted data ---
-        fin.seekg(aligned_start, std::ios::beg);
-
         std::vector<uint8_t> enc(aligned_size);
-        fin.read(reinterpret_cast<char*>(enc.data()), aligned_size);
 
-        if (static_cast<uint64_t>(fin.gcount()) != aligned_size)
+        if (!read_at(aligned_start, reinterpret_cast<char*>(enc.data()), aligned_size))
             throw std::runtime_error("Short read during aligned decrypt");
 
         // --- decrypt ---
@@ -1330,7 +1346,6 @@ void decrypt_pfs0_file_inplace(
 
 void decrypt_partition_table(
     HWND hwnd,
-    std::ifstream& fin,
     std::fstream& fout,
     uint64_t nca_offset,
     const NcaHeader& nca_header,
@@ -1362,9 +1377,8 @@ void decrypt_partition_table(
     uint64_t data_offset = section_offset + hash_region_size + nca_offset;
 
     // --- read first 0x10 bytes ---
-    fin.seekg(data_offset, std::ios::beg);
     std::vector<uint8_t> enc(0x10);
-    fin.read(reinterpret_cast<char*>(enc.data()), enc.size());
+    read_at(data_offset, reinterpret_cast<char*>(enc.data()), enc.size());
 
     auto dec = aes_ctr_decrypt(enc, content_key, section, section_offset + hash_region_size);
 
@@ -1385,9 +1399,8 @@ void decrypt_partition_table(
     uint64_t metadata_size = header_size + entries_size + string_table_size;
 
     // --- decrypt metadata ---
-    fin.seekg(data_offset, std::ios::beg);
     std::vector<uint8_t> enc_meta(metadata_size);
-    fin.read(reinterpret_cast<char*>(enc_meta.data()), enc_meta.size());
+    read_at(data_offset, reinterpret_cast<char*>(enc_meta.data()), enc_meta.size());
 
     auto dec_meta = aes_ctr_decrypt(enc_meta, content_key, section, section_offset + hash_region_size);
 
@@ -1432,7 +1445,7 @@ void decrypt_partition_table(
 
         decrypt_pfs0_file_inplace(
             hwnd,
-            fin, fout,
+            fout,
             name,
             e.offset,
             e.size,
@@ -1447,16 +1460,14 @@ void decrypt_partition_table(
     LogMessage(hwnd, StrBuilder{} << "        [*] PartitionFS fully decrypted\n");
 }
 
-void decrypt_nca(HWND hwnd, std::ifstream& fin, std::fstream& fout, const Partition& partition, KeyStore& keys) {
+void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyStore& keys) {
     uint64_t nca_offset = partition.hfs0_offset + partition.offset;
     LogMessage(hwnd, StrBuilder{} << "[INFO] Decrypt NCA Start for " << partition.name
         << " at 0x" << std::hex << nca_offset << "\n");
 
     // Seek and read header
-    fin.seekg(nca_offset, std::ios::beg);
     std::vector<uint8_t> header(0xC00);
-    fin.read(reinterpret_cast<char*>(header.data()), header.size());
-    if (fin.gcount() != static_cast<std::streamsize>(header.size())) {
+    if (!read_at(nca_offset, reinterpret_cast<char*>(header.data()), header.size())) {
         ShowError(hwnd, StrBuilder{} << "[!] Failed to read full NCA header\n");
         return;
     }
@@ -1522,10 +1533,10 @@ void decrypt_nca(HWND hwnd, std::ifstream& fin, std::fstream& fout, const Partit
 
         NcaFsHeader section = parse_nca_fs_header(std::vector<char>(header.begin() + fs_header_offset, header.begin() + fs_header_offset + 0x200));
         if (section.fs_type == 0) {
-            decrypt_romfs(hwnd, fin, fout, nca_offset, nca_header, section, i, keys);
+            decrypt_romfs(hwnd, fout, nca_offset, nca_header, section, i, keys);
         }
         else if (section.fs_type == 1) {
-            decrypt_partition_table(hwnd, fin, fout, nca_offset, nca_header, section, i, keys);
+            decrypt_partition_table(hwnd, fout, nca_offset, nca_header, section, i, keys);
         }
         else {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Unknown partition type: " << section.fs_type << "\n");
@@ -1537,27 +1548,25 @@ void decrypt_nca(HWND hwnd, std::ifstream& fin, std::fstream& fout, const Partit
 }
 
 // ---------------- Parse HFS0 Partitions ----------------
-std::vector<Partition> parse_hfs0_partitions(HWND hwnd, std::ifstream& fin, uint64_t hfs0_offset) {
+std::vector<Partition> parse_hfs0_partitions(HWND hwnd, uint64_t hfs0_offset) {
     LogMessage(hwnd, StrBuilder{} << "[INFO] parse_hfs0_partitions at 0x" << std::hex << hfs0_offset << "\n");
-    fin.seekg(hfs0_offset, std::ios::beg);
 
     char magic[4];
-    fin.read(magic, 4);
+    read_at(hfs0_offset, magic, 4);
+
     if (std::string(magic, 4) != "HFS0") {
         throw std::runtime_error("Invalid HFS0 magic at offset " + std::to_string(hfs0_offset));
     }
 
     uint32_t file_count;
     uint32_t string_table_size;
-    fin.read(reinterpret_cast<char*>(&file_count), 4);
-    fin.read(reinterpret_cast<char*>(&string_table_size), 4);
+    read_at(hfs0_offset + 4, reinterpret_cast<char*>(&file_count), 4);
+    read_at(hfs0_offset + 8, reinterpret_cast<char*>(&string_table_size), 4);
 
     const uint64_t PartitionFsHeader_Size = 0x10;
     const uint64_t ENTRY_SIZE = 0x40;
     uint64_t string_table_offset = PartitionFsHeader_Size + (file_count * ENTRY_SIZE);
     uint64_t file_data_region = string_table_offset + string_table_size;
-
-    fin.seekg(4, std::ios::cur); // Skip reserved
 
     LogMessage(hwnd, StrBuilder{} << "[INFO] Found " << std::dec << file_count << " partitions\n");
     LogMessage(hwnd, StrBuilder{} << "[INFO] String table size: 0x" << std::hex << string_table_size << "\n");
@@ -1565,10 +1574,11 @@ std::vector<Partition> parse_hfs0_partitions(HWND hwnd, std::ifstream& fin, uint
 
     struct Entry { uint64_t rel_offset; uint64_t size; uint32_t str_offset; };
     std::vector<Entry> entries;
-
+    int64_t readpos = hfs0_offset + 16;
     for (uint32_t i = 0; i < file_count; ++i) {
         std::vector<char> entry_buf(ENTRY_SIZE);
-        fin.read(entry_buf.data(), ENTRY_SIZE);
+        read_at(readpos, entry_buf.data(), ENTRY_SIZE);
+        readpos += ENTRY_SIZE;
 
         uint64_t rel_offset = *reinterpret_cast<uint64_t*>(entry_buf.data());
         uint64_t size = *reinterpret_cast<uint64_t*>(entry_buf.data() + 8);
@@ -1580,10 +1590,17 @@ std::vector<Partition> parse_hfs0_partitions(HWND hwnd, std::ifstream& fin, uint
     uint64_t string_table_base = hfs0_offset + string_table_offset;
 
     for (auto& e : entries) {
-        fin.seekg(string_table_base + e.str_offset, std::ios::beg);
+        uint64_t name_offset = string_table_base + e.str_offset;
         std::string name;
-        char c;
-        while (fin.get(c) && c != '\0') {
+        while (name_offset < g_rom_size)
+        {
+            char c = static_cast<char>(
+                g_rom_data[name_offset++]
+                );
+
+            if (c == '\0')
+                break;
+
             name += c;
         }
         partitions.push_back({ name, hfs0_offset, e.rel_offset, e.rel_offset + file_data_region, e.size });
@@ -1594,7 +1611,6 @@ std::vector<Partition> parse_hfs0_partitions(HWND hwnd, std::ifstream& fin, uint
 
 void load_ticket(
     HWND hwnd, 
-    std::ifstream& fin,
     const Partition& part,
     KeyStore& keys,
     uint64_t hfs0_offset,
@@ -1608,12 +1624,9 @@ void load_ticket(
     LogMessage(hwnd, StrBuilder{} << "part[offset]: 0x" << part.offset
         << " size: 0x" << part.size << "\n");
 
-    fin.seekg(hfs0_offset + offset + part.offset, std::ios::beg);
-
     std::vector<uint8_t> raw(part.size);
-    fin.read(reinterpret_cast<char*>(raw.data()), raw.size());
 
-    if (fin.gcount() < 4) {
+    if (!read_at(hfs0_offset + offset + part.offset, reinterpret_cast<char*>(raw.data()), raw.size())) {
         ShowError(hwnd, StrBuilder{} << "        [!] Ticket too small\n");
         return;
     }
@@ -1683,7 +1696,7 @@ void load_ticket(
 }
 
 // ---------------- decrypt_partition ----------------
-void decrypt_partition(HWND hwnd, std::ifstream& fin, std::fstream& fout,
+void decrypt_partition(HWND hwnd, std::fstream& fout,
     uint64_t hfs0_offset, uint64_t offset,
     uint64_t size, const std::string& name,
     KeyStore& keys) {
@@ -1692,94 +1705,223 @@ void decrypt_partition(HWND hwnd, std::ifstream& fin, std::fstream& fout,
         << " size 0x" << size << "\n");
 
     // Peek magic at offset
-    fin.seekg(hfs0_offset + offset, std::ios::beg);
     char magic[4] = { 0 };
-    fin.read(magic, 4);
+    read_at(hfs0_offset + offset, magic, 4);
 
     if (std::string(magic, 4) == "HFS0") {
         // Parse partitions
-        auto partitions = parse_hfs0_partitions(hwnd, fin, hfs0_offset + offset);
+        auto partitions = parse_hfs0_partitions(hwnd, hfs0_offset + offset);
         for (auto& p : partitions) {
             if (p.name.size() >= 4 && p.name.substr(p.name.size() - 4) == ".tik") {
-                load_ticket(hwnd, fin, p, keys, hfs0_offset, offset);
+                load_ticket(hwnd, p, keys, hfs0_offset, offset);
             }
         }
         for (auto& p : partitions) {
             if (p.name.size() >= 4 && p.name.substr(p.name.size() - 4) == ".nca") {
-                decrypt_nca(hwnd, fin, fout, p, keys);
+                decrypt_nca(hwnd, fout, p, keys);
             }
         }
     }
 }
 
-void CopyFileWithProgress(
-    HWND hwnd,
-    const fs::path& input_path,
-    const fs::path& output_path)
+void CloseMappedFile()
 {
-    std::ifstream input(
-        input_path,
-        std::ios::binary);
+    if (g_rom_data)
+    {
+        UnmapViewOfFile(g_rom_data);
+        g_rom_data = nullptr;
+    }
 
-    std::ofstream output(
-        output_path,
-        std::ios::binary);
+    if (g_rom_mapping)
+    {
+        CloseHandle(g_rom_mapping);
+        g_rom_mapping = nullptr;
+    }
 
-    if (!input || !output)
-        throw std::runtime_error("Failed to open file.");
+    if (g_rom_file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_rom_file);
+        g_rom_file = INVALID_HANDLE_VALUE;
+    }
 
-    uint64_t total_size = fs::file_size(input_path);
-    uint64_t copied = 0;
+    g_rom_size = 0;
+}
 
-    constexpr size_t BUFFER_SIZE = 1024 * 1024; // 1 MB
-    std::vector<char> buffer(BUFFER_SIZE);
+bool LoadFileToMemory(
+    const std::filesystem::path& path,
+    HWND hwnd
+)
+{
+    CloseMappedFile();
+    g_rom_file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
 
+    if (g_rom_file == INVALID_HANDLE_VALUE)
+    {
+        LogMessage(hwnd, "Failed to open input file\n");
+        return false;
+    }
+
+
+    LARGE_INTEGER size;
+
+    if (!GetFileSizeEx(g_rom_file, &size))
+    {
+        LogMessage(hwnd, "Failed getting file size\n");
+
+        CloseHandle(g_rom_file);
+        g_rom_file = INVALID_HANDLE_VALUE;
+
+        return false;
+    }
+
+
+    g_rom_size = static_cast<uint64_t>(size.QuadPart);
+
+
+    g_rom_mapping = CreateFileMappingW(
+        g_rom_file,
+        nullptr,
+        PAGE_READONLY,
+        0,
+        0,
+        nullptr
+    );
+
+
+    if (!g_rom_mapping)
+    {
+        LogMessage(hwnd, "Failed creating file mapping\n");
+
+        CloseHandle(g_rom_file);
+        g_rom_file = INVALID_HANDLE_VALUE;
+
+        g_rom_size = 0;
+
+        return false;
+    }
+
+
+    g_rom_data = static_cast<uint8_t*>(
+        MapViewOfFile(
+            g_rom_mapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            0
+        )
+        );
+
+
+    if (!g_rom_data)
+    {
+        LogMessage(hwnd, "Failed mapping file\n");
+
+        CloseHandle(g_rom_mapping);
+        CloseHandle(g_rom_file);
+
+        g_rom_mapping = nullptr;
+        g_rom_file = INVALID_HANDLE_VALUE;
+        g_rom_size = 0;
+
+        return false;
+    }
+
+
+    LogMessage(
+        hwnd,
+        "Mapped ROM: " +
+        std::to_string(g_rom_size) +
+        " bytes\n"
+    );
+
+
+    return true;
+}
+
+bool SaveFileWithProgress(
+    HWND hwnd,
+    const std::filesystem::path& path
+)
+{
+    if (!g_rom_data || g_rom_size == 0)
+    {
+        LogMessage(hwnd, "No ROM data loaded\n");
+        return false;
+    }
+
+    std::ofstream out(
+        path,
+        std::ios::binary | std::ios::trunc
+    );
+
+    if (!out)
+    {
+        LogMessage(hwnd, "Failed to create output file\n");
+        return false;
+    }
+
+    LogMessage(
+        hwnd,
+        "Saving copy ..."
+    );
+
+    constexpr uint64_t BUF_SIZE = 0x100000; // 1MB
+
+    uint64_t written = 0;
     HWND progress = GetDlgItem(hwnd, IDC_PROGRESS);
-
     SendMessage(
         progress,
         PBM_SETRANGE,
         0,
         MAKELPARAM(0, 100));
 
-    LogMessage(
-        hwnd,
-        "Copying: " + input_path.string());
-
-    while (input)
+    while (written < g_rom_size)
     {
-        if (g_cancel_decrypt)
+        uint64_t size = std::min(
+            BUF_SIZE,
+            g_rom_size - written
+        );
+
+        out.write(
+            reinterpret_cast<const char*>(
+                g_rom_data + written
+                ),
+            size
+        );
+
+        if (!out)
         {
-            return;
+            LogMessage(hwnd, "Write failed\n");
+            return false;
         }
-        input.read(
-            buffer.data(),
-            buffer.size());
 
-        std::streamsize bytes = input.gcount();
+        written += size;
 
-        if (bytes > 0)
-        {
-            output.write(
-                buffer.data(),
-                bytes);
+        g_decrypt_progress.processed_bytes = written;
 
-            copied += bytes;
+        // optional UI update
+        int percent = static_cast<int>(
+            (static_cast<float>(written) / static_cast<float>(g_rom_size)) * 100);
 
-            int percent = static_cast<int>(
-                (copied * 100) / total_size);
+        SendMessage(
+            progress,
+            PBM_SETPOS,
+            percent,
+            0);
 
-            SendMessage(
-                progress,
-                PBM_SETPOS,
-                percent,
-                0);
-        }
     }
 
-    LogMessage(
-        hwnd,
-        "Copy complete.");
+    out.close();
+
+    return true;
 }
 
 bool convert_nsp(HWND hwnd,
@@ -1801,33 +1943,31 @@ bool convert_nsp(HWND hwnd,
         fs::remove(output_path);
     }
     fs::create_directories(output_dir);
-    CopyFileWithProgress(hwnd, input_path, output_path);
+    if (!LoadFileToMemory(input_path, hwnd))
+        throw std::runtime_error("Failed to open NSP");
+    SaveFileWithProgress(hwnd, output_path);
     if (g_cancel_decrypt)
     {
         return false;
     }
 
-    std::ifstream fin(input_path, std::ios::binary);
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
-    if (!fin || !fout)
-        throw std::runtime_error("Failed to open NSP");
+    if (!fout)
+        throw std::runtime_error("Failed to open NSP outpur");
 
     // Parse root PFS0
-    fin.seekg(0, std::ios::beg);
-
     char magic[4];
-    fin.read(magic, 4);
+    read_at(0, magic, 4);
+
     if (std::string(magic, 4) != "PFS0")
         throw std::runtime_error("Invalid NSP");
 
     uint32_t file_count;
     uint32_t string_table_size;
 
-    fin.read(reinterpret_cast<char*>(&file_count), 4);
-    fin.read(reinterpret_cast<char*>(&string_table_size), 4);
-
-    fin.seekg(4, std::ios::cur); // skip reserved
+    read_at(4, reinterpret_cast<char*>(&file_count), 4);
+    read_at(8, reinterpret_cast<char*>(&string_table_size), 4);
 
     struct Entry {
         uint64_t offset;
@@ -1837,8 +1977,10 @@ bool convert_nsp(HWND hwnd,
 
     std::vector<Entry> entries(file_count);
 
+    uint64_t readpos = 16;
     for (uint32_t i = 0; i < file_count; i++) {
-        fin.read(reinterpret_cast<char*>(&entries[i]), sizeof(Entry));
+        read_at(readpos, reinterpret_cast<char*>(&entries[i]), sizeof(Entry));
+        readpos += sizeof(Entry);
     }
 
     uint64_t string_table_offset = 0x10 + file_count * 0x18;
@@ -1846,10 +1988,19 @@ bool convert_nsp(HWND hwnd,
 
     // ---- Pass 1: load tickets ----
     for (auto& e : entries) {
-        fin.seekg(string_table_offset + e.name_offset);
+        uint64_t name_offset = string_table_offset + e.name_offset;
         std::string name;
-        char c;
-        while (fin.get(c) && c != '\0') name += c;
+        while (name_offset < g_rom_size)
+        {
+            char c = static_cast<char>(
+                g_rom_data[name_offset++]
+                );
+
+            if (c == '\0')
+                break;
+
+            name += c;
+        }
 
         if (name.ends_with(".tik")) {
             Partition fake{
@@ -1860,16 +2011,25 @@ bool convert_nsp(HWND hwnd,
                 e.size
             };
 
-            load_ticket(hwnd, fin, fake, keys, 0, 0);
+            load_ticket(hwnd, fake, keys, 0, 0);
         }
     }
 
     // ---- Pass 2: decrypt NCAs ----
     for (auto& e : entries) {
-        fin.seekg(string_table_offset + e.name_offset);
+        uint64_t name_offset = string_table_offset + e.name_offset;
         std::string name;
-        char c;
-        while (fin.get(c) && c != '\0') name += c;
+        while (name_offset < g_rom_size)
+        {
+            char c = static_cast<char>(
+                g_rom_data[name_offset++]
+                );
+
+            if (c == '\0')
+                break;
+
+            name += c;
+        }
 
         if (name.ends_with(".nca")) {
             Partition fake{
@@ -1880,7 +2040,7 @@ bool convert_nsp(HWND hwnd,
                 e.size
             };
 
-            decrypt_nca(hwnd, fin, fout, fake, keys);
+            decrypt_nca(hwnd, fout, fake, keys);
         }
     }
 
@@ -1916,34 +2076,33 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
     }
 
     fs::create_directories(output_dir);
-    CopyFileWithProgress(hwnd,input_path,output_path);
+    if (LoadFileToMemory(input_path, hwnd))
+        throw std::runtime_error("Failed to open input file.");
+    SaveFileWithProgress(hwnd,output_path);
     if (g_cancel_decrypt)
     {
         return false;
     }
     LogMessage(hwnd, StrBuilder{} << "decrypting " << input_path << " ...\n");
 
-    std::ifstream fin(input_path, std::ios::binary);
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
-    if (!fin || !fout) throw std::runtime_error("Failed to open input/output files.");
+    if (!fout) throw std::runtime_error("Failed to open output file.");
 
     // Verify HEAD magic
-    fin.seekg(0x100, std::ios::beg);
     char magic[4];
-    fin.read(magic, 4);
+    read_at(0x100, magic, 4);
+
     if (std::string(magic, 4) != "HEAD") {
         throw std::runtime_error("Invalid XCI magic number.");
     }
 
     // Read HFS0 offset/size
-    fin.seekg(0x130, std::ios::beg);
     uint64_t hfs0_offset;
-    fin.read(reinterpret_cast<char*>(&hfs0_offset), 8);
+    read_at(0x130, reinterpret_cast<char*>(&hfs0_offset), 8);
 
-    fin.seekg(0x138, std::ios::beg);
     uint64_t hfs0_size;
-    fin.read(reinterpret_cast<char*>(&hfs0_size), 8);
+    read_at(0x138, reinterpret_cast<char*>(&hfs0_size), 8);
 
     LogMessage(hwnd, StrBuilder{} << "[INFO] HFS0PartitionOffset: 0x" << std::hex << hfs0_offset << "\n");
     LogMessage(hwnd, StrBuilder{} << "[INFO] HFS0HeaderSize:      0x" << std::hex << hfs0_size << "\n");
@@ -1954,7 +2113,7 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
     fout.write("DXCI", 4);
 
     // Parse partitions
-    auto partitions = parse_hfs0_partitions(hwnd, fin, hfs0_offset);
+    auto partitions = parse_hfs0_partitions(hwnd, hfs0_offset);
 
     if (g_cancel_decrypt)
     {
@@ -1984,7 +2143,7 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
             << ", size=0x" << std::hex << p.size << "\n");
 
         g_decrypt_progress.current_partition_bytes = 0;
-        decrypt_partition(hwnd, fin, fout, hfs0_offset, p.offset, p.size, p.name, keys);
+        decrypt_partition(hwnd, fout, hfs0_offset, p.offset, p.size, p.name, keys);
         g_decrypt_progress.processed_bytes += p.size;
         int percent = static_cast<int>(
             (g_decrypt_progress.processed_bytes * 100) /
@@ -2182,6 +2341,7 @@ INT_PTR CALLBACK MainDlgProc(
     }
     case WM_CONVERT_DONE:
     {
+        CloseMappedFile();
         if (wParam)
         {
             MessageBoxA(
