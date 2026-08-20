@@ -2076,7 +2076,7 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
     }
 
     fs::create_directories(output_dir);
-    if (LoadFileToMemory(input_path, hwnd))
+    if (!LoadFileToMemory(input_path, hwnd))
         throw std::runtime_error("Failed to open input file.");
     SaveFileWithProgress(hwnd,output_path);
     if (g_cancel_decrypt)
@@ -2268,6 +2268,100 @@ DWORD WINAPI ConvertThread(LPVOID param)
     return 0;
 }
 
+std::filesystem::path GetConfigPath()
+{
+    wchar_t buffer[MAX_PATH];
+
+    DWORD length = GetModuleFileNameW(
+        nullptr,
+        buffer,
+        MAX_PATH
+    );
+
+    if (length == 0)
+        return {};
+
+    return std::filesystem::path(buffer)
+        .parent_path() / L"nxconvert.ini";
+}
+
+bool LoadConfiguration(
+    const std::filesystem::path& configPath,
+    std::wstring& input,
+    std::wstring& output,
+    std::wstring& keys,
+    bool& overwrite
+)
+{
+    std::wifstream file(configPath);
+
+    if (!file)
+    {
+        // No configuration yet - use defaults.
+        return false;
+    }
+
+    std::wstring line;
+    std::wstring section;
+
+    while (std::getline(file, line))
+    {
+        if (line.empty())
+            continue;
+
+        // Section
+        if (line.front() == L'[' && line.back() == L']')
+        {
+            section = line.substr(1, line.size() - 2);
+            continue;
+        }
+
+        if (section != L"Settings")
+            continue;
+
+        size_t equals = line.find(L'=');
+
+        if (equals == std::wstring::npos)
+            continue;
+
+        std::wstring name = line.substr(0, equals);
+        std::wstring value = line.substr(equals + 1);
+
+        if (name == L"Input")
+            input = value;
+        else if (name == L"Output")
+            output = value;
+        else if (name == L"Keys")
+            keys = value;
+        else if (name == L"Overwrite")
+            overwrite = (value == L"1");
+    }
+
+    return true;
+}
+
+bool SaveConfiguration(
+    const std::filesystem::path& configPath,
+    const std::string& input,
+    const std::string& output,
+    const std::string& keys,
+    bool overwrite
+)
+{
+    std::ofstream file(configPath);
+
+    if (!file)
+        return false;
+
+    file << "[Settings]\n";
+    file << "Input=" << input << "\n";
+    file << "Output=" << output << "\n";
+    file << "Keys=" << keys << "\n";
+    file << "Overwrite=" << (overwrite ? "1" : "0") << "\n";
+
+    return file.good();
+}
+
 INT_PTR CALLBACK MainDlgProc(
     HWND hwnd,
     UINT msg,
@@ -2317,6 +2411,30 @@ INT_PTR CALLBACK MainDlgProc(
         SendMessage(GetDlgItem(hwnd, IDC_LOG), EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
         SetUiBusy(hwnd, false);
 
+        auto configPath = GetConfigPath();
+
+        std::wstring input;
+        std::wstring output;
+        std::wstring keys;
+        bool overwrite = false;
+
+        LoadConfiguration(
+            configPath,
+            input,
+            output,
+            keys,
+            overwrite
+        );
+
+        SetDlgItemTextW(hwnd, IDC_INPUT, input.c_str());
+        SetDlgItemTextW(hwnd, IDC_OUTPUT, output.c_str());
+        SetDlgItemTextW(hwnd, IDC_KEYS, keys.c_str());
+
+        CheckDlgButton(
+            hwnd,
+            IDC_OVERWRITE,
+            overwrite ? BST_CHECKED : BST_UNCHECKED
+        );
         return TRUE;
     }
     case WM_LOG_MESSAGE:
@@ -2432,6 +2550,16 @@ INT_PTR CALLBACK MainDlgProc(
                 ctx->output_dir = output_dir;
                 ctx->key_file = key_file;
                 ctx->overwrite = overwrite;
+
+                auto configPath = GetConfigPath();
+
+                SaveConfiguration(
+                    configPath,
+                    input_file,
+                    output_dir,
+                    key_file,
+                    overwrite
+                );
 
                 CreateThread(
                     nullptr,
