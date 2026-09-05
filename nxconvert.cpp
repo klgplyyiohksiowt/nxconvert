@@ -168,6 +168,7 @@ struct DecryptProgress
 
 static DecryptProgress g_decrypt_progress;
 static std::atomic<bool> g_cancel_decrypt = false;
+static std::atomic<bool> g_decrypt_failed = false;
 
 bool read_at(
     uint64_t offset,
@@ -770,7 +771,9 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
         auto it = keys.titlekeys.find(rights_id_hex);
         if (it == keys.titlekeys.end()) {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Missing title key for Rights ID: " << rights_id_hex << "\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
 
         std::vector<uint8_t> kek_key = get_title_kek_key(keys, nca_header);
@@ -799,7 +802,9 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
 
     if (non_zero.size() != 1) {
         ShowError(hwnd, StrBuilder{} << "[FATAL] Expected exactly 1 content key, found " << non_zero.size() << "\n");
-        std::exit(1);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     return non_zero[0].second;  // Return the content key (the only non-zero key)
@@ -823,7 +828,9 @@ void decrypt_aes_ctr_section(
     auto content_key = get_content_key(hwnd, nca_header, section, keys);
     if (content_key.size() != 16) {
         ShowError(hwnd, StrBuilder{} << "[FATAL] content_key must be 16 bytes\n");
-        std::exit(1);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
     }
 
     std::array<uint8_t, 16> key{};
@@ -850,7 +857,9 @@ void decrypt_aes_ctr_section(
 
         if (!read_at(abs_offset + offset_in_section, reinterpret_cast<char*>(enc.data()), chunk)) {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Short read while decrypting RomFS\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
 
         std::vector<uint8_t> dec = aes_ctr_decrypt(enc, content_key, section, section_offset + offset_in_section);
@@ -1246,8 +1255,9 @@ void decrypt_romfs(
 
     case 2: // AesXts
         ShowError(hwnd, StrBuilder{} << "[FATAL] AesXts RomFS decryption not implemented yet\n");
-        std::exit(1);
-        break;
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
 
     case 3: // AesCtr
         decrypt_aes_ctr_section(
@@ -1275,7 +1285,9 @@ void decrypt_romfs(
     default:
         ShowError(hwnd, StrBuilder{} << "[FATAL] Unknown encryption type: "
             << int(section.encryption_type) << "\n");
-        std::exit(1);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
     }
 }
 
@@ -1480,12 +1492,16 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
     if (magic != "NCA3" && magic != "NCA2") {
         if (keys.keys.find("header_key") == keys.keys.end()) {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Missing 'header_key' in key file\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
         std::vector<uint8_t>& header_key = keys.keys["header_key"];
         if (header_key.size() != 32) {
             ShowError(hwnd, StrBuilder{} << "[FATAL] header_key must be 32 bytes\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
 
         std::vector<uint8_t> header_bytes(header.begin(), header.end());
@@ -1498,7 +1514,9 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
 
         if (new_magic != "NCA3" && new_magic != "NCA2") {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Not a valid NCA header after decryption\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
 
         std::copy(dec.begin(), dec.end(), header.begin());
@@ -1516,6 +1534,7 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
 
     // Process FS entries
     for (int i = 0; i < 4; ++i) {
+        if (g_decrypt_failed) return;
         FsEntry& entry = nca_header.fs_entries[i];
         uint64_t fs_header_offset = 0x400 + i * 0x200;
 
@@ -1540,7 +1559,9 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
         }
         else {
             ShowError(hwnd, StrBuilder{} << "[FATAL] Unknown partition type: " << section.fs_type << "\n");
-            std::exit(1);
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
     }
 
@@ -1712,11 +1733,13 @@ void decrypt_partition(HWND hwnd, std::fstream& fout,
         // Parse partitions
         auto partitions = parse_hfs0_partitions(hwnd, hfs0_offset + offset);
         for (auto& p : partitions) {
+            if (g_decrypt_failed) return;
             if (p.name.size() >= 4 && p.name.substr(p.name.size() - 4) == ".tik") {
                 load_ticket(hwnd, p, keys, hfs0_offset, offset);
             }
         }
         for (auto& p : partitions) {
+            if (g_decrypt_failed) return;
             if (p.name.size() >= 4 && p.name.substr(p.name.size() - 4) == ".nca") {
                 decrypt_nca(hwnd, fout, p, keys);
             }
@@ -2177,9 +2200,12 @@ bool convert_file(HWND hwnd, const std::string& input_path, const std::string& o
 #define WM_CONVERT_DONE     (WM_APP + 1)
 #define WM_CONVERT_CANCELED (WM_APP + 2)
 #define WM_LOG_MESSAGE      (WM_APP + 3)
+#define WM_CONVERT_FAILED   (WM_APP + 4)
 
 void ShowError(HWND hwnd, const std::string& message)
 {
+    auto* str = new std::string(message);
+    PostMessage(hwnd, WM_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(str));
 }
 
 void LogMessage(HWND hwnd, const std::string& message)
@@ -2228,6 +2254,7 @@ DWORD WINAPI ConvertThread(LPVOID param)
     SetUiBusy(ctx->hwnd, true);
     ClearLog(ctx->hwnd);
     g_cancel_decrypt = false;
+    g_decrypt_failed = false;
     try
     {
         KeyStore ks = load_keys(ctx->key_file);
@@ -2256,7 +2283,14 @@ DWORD WINAPI ConvertThread(LPVOID param)
             FALSE,
             0);
     }
-    if (g_cancel_decrypt) {
+    if (g_decrypt_failed) {
+        PostMessage(
+            ctx->hwnd,
+            WM_CONVERT_FAILED,
+            0,
+            0);
+    }
+    else if (g_cancel_decrypt) {
         PostMessage(
             ctx->hwnd,
             WM_CONVERT_CANCELED,
@@ -2488,6 +2522,15 @@ INT_PTR CALLBACK MainDlgProc(
         MessageBoxA(
             hwnd,
             "Conversion canceled.",
+            "NXConvert",
+            MB_ICONINFORMATION);
+        return TRUE;
+    }
+    case WM_CONVERT_FAILED:
+    {
+        MessageBoxA(
+            hwnd,
+            "Conversion failed.",
             "NXConvert",
             MB_ICONINFORMATION);
         return TRUE;
