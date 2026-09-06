@@ -30,9 +30,21 @@ HANDLE g_rom_file = INVALID_HANDLE_VALUE;
 HANDLE g_rom_mapping = nullptr;
 uint8_t* g_rom_data = nullptr;
 uint64_t g_rom_size = 0;
+static std::atomic<bool> g_cancel_decrypt = false;
+static std::atomic<bool> g_decrypt_failed = false;
 
 void ShowError(HWND hwnd, const std::string& message);
 void LogMessage(HWND hwnd, const std::string& message);
+
+struct StrBuilder {
+    std::ostringstream oss;
+    template <typename T>
+    StrBuilder& operator<<(const T& val) {
+        oss << val;
+        return *this;
+    }
+    operator std::string() const { return oss.str(); }
+};
 
 // Namespace alias for filesystem
 namespace fs = std::filesystem;
@@ -126,37 +138,36 @@ struct NcaFsHeader{
     std::array<uint8_t, 4> SecureValue;
 
     // Dummy hash region size
-    uint64_t hash_region_size() const {
+    uint64_t hash_region_size(HWND hwnd) const {
         // Hierarchical SHA256 (PartitionFS)
         if (hash_type == 2 || hash_type == 5)
         {
-            if (sha256.hash_layer_count == 0)
-                throw std::runtime_error("Invalid SHA256 layer count");
-
+            if (sha256.hash_layer_count == 0) {
+                ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid SHA256 layer count");
+                g_decrypt_failed = true;
+                g_cancel_decrypt = true;
+                return 0;
+            }
             return sha256.hash_layer_region[sha256.hash_layer_count - 1].offset;
         }
 
         // Integrity hash (RomFS)
         if (hash_type == 3 || hash_type == 6)
         {
-            if (integrity.max_layers < 2)
-                throw std::runtime_error("Invalid integrity layer count");
-
+            if (integrity.max_layers < 2) {
+                ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid integrity layer count");
+                g_decrypt_failed = true;
+                g_cancel_decrypt = true;
+                return 0;
+            }
             return integrity.levels[integrity.max_layers - 2].offset;
         }
 
-        throw std::runtime_error("Unsupported hash_type");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Unsupported hash_type");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return 0;
     }
-};
-
-struct StrBuilder {
-    std::ostringstream oss;
-    template <typename T>
-    StrBuilder& operator<<(const T& val) {
-        oss << val;
-        return *this;
-    }
-    operator std::string() const { return oss.str(); }
 };
 
 struct DecryptProgress
@@ -167,8 +178,6 @@ struct DecryptProgress
 };
 
 static DecryptProgress g_decrypt_progress;
-static std::atomic<bool> g_cancel_decrypt = false;
-static std::atomic<bool> g_decrypt_failed = false;
 
 bool read_at(
     uint64_t offset,
@@ -198,9 +207,12 @@ const size_t CHUNK_SIZE = 0x1000000;
 static constexpr std::size_t SectorShift = 9; 
 static constexpr uint64_t SectorToByte(uint32_t sector) { return static_cast<uint64_t>(sector) << SectorShift; }
 
-std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
+std::vector<uint8_t> hex_to_bytes(HWND hwnd, const std::string& hex) {
     if (hex.size() % 2 != 0) {
-        throw std::runtime_error("Invalid hex string length");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid hex string length");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     std::vector<uint8_t> bytes;
@@ -288,10 +300,15 @@ NcaHeader parse_nca_header(const std::vector<uint8_t>& buf) {
     return hdr;
 }
 
-HierarchicalSha256Data parse_hierarchical_sha256(const std::vector<uint8_t>& buf)
+HierarchicalSha256Data parse_hierarchical_sha256(HWND hwnd, const std::vector<uint8_t>& buf)
 {
     if (buf.size() < 0x28)
-        throw std::runtime_error("SHA256 header too small");
+    {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] SHA256 header too small");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     HierarchicalSha256Data out{};
 
@@ -307,8 +324,12 @@ HierarchicalSha256Data parse_hierarchical_sha256(const std::vector<uint8_t>& buf
     size_t base = 0x28;
     size_t needed = base + out.hash_layer_count * 0x10;
 
-    if (buf.size() < needed)
-        throw std::runtime_error("SHA256 region table truncated");
+    if (buf.size() < needed) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] SHA256 region table truncated");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     out.hash_layer_region.reserve(out.hash_layer_count);
 
@@ -338,10 +359,14 @@ NcaPatchInfo parse_patch_info(const std::vector<uint8_t>& buf)
     return out;
 }
 
-IntegrityMetaInfo parse_integrity_meta(const std::vector<uint8_t>& buf)
+IntegrityMetaInfo parse_integrity_meta(HWND hwnd, const std::vector<uint8_t>& buf)
 {
-    if (buf.size() < 0x10)
-        throw std::runtime_error("Integrity meta too small");
+    if (buf.size() < 0x10) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Integrity meta too small");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     IntegrityMetaInfo out{};
 
@@ -350,15 +375,23 @@ IntegrityMetaInfo parse_integrity_meta(const std::vector<uint8_t>& buf)
     out.master_hash_size = read_u32_le(&buf[0x08]);
     out.max_layers = read_u32_le(&buf[0x0C]);
 
-    if (out.max_layers < 2)
-        throw std::runtime_error("Integrity meta invalid layer count");
+    if (out.max_layers < 2) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Integrity meta invalid layer count");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     size_t base = 0x10;
     size_t level_count = out.max_layers - 1;
     size_t needed = base + level_count * 0x18;
 
-    if (buf.size() < needed)
-        throw std::runtime_error("Integrity level table truncated");
+    if (buf.size() < needed) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Integrity level table truncated");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     out.levels.reserve(level_count);
 
@@ -377,8 +410,13 @@ IntegrityMetaInfo parse_integrity_meta(const std::vector<uint8_t>& buf)
     return out;
 }
 
-NcaFsHeader parse_nca_fs_header(const std::vector<char>& buf) {
-    if (buf.size() != 0x200) throw std::runtime_error("FS header must be 0x200 bytes");
+NcaFsHeader parse_nca_fs_header(HWND hwnd, const std::vector<char>& buf) {
+    if (buf.size() != 0x200) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] FS header must be 0x200 bytes");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     NcaFsHeader hdr{ 0 };
     hdr.version = static_cast<uint16_t>((uint8_t)buf[0] | ((uint8_t)buf[1] << 8));
@@ -392,10 +430,10 @@ NcaFsHeader parse_nca_fs_header(const std::vector<char>& buf) {
     std::vector<uint8_t> hash_data(buf.begin() + 0x08, buf.begin() + 0x100);
 
     if (hdr.hash_type == 2 || hdr.hash_type == 5)
-        hdr.sha256 = parse_hierarchical_sha256(hash_data);
+        hdr.sha256 = parse_hierarchical_sha256(hwnd, hash_data);
 
     else if (hdr.hash_type == 3 || hdr.hash_type == 6)
-        hdr.integrity = parse_integrity_meta(hash_data);
+        hdr.integrity = parse_integrity_meta(hwnd, hash_data);
 
     std::vector<uint8_t> patch_data(buf.begin() + 0x100, buf.begin() + 0x140);
     hdr.patch_info = parse_patch_info(patch_data);
@@ -412,19 +450,25 @@ public:
         keys[key] = value;
     }
 
-    std::vector<uint8_t> get(const std::string& key) const {
+    std::vector<uint8_t> get(HWND hwnd, const std::string& key) const {
         auto it = keys.find(key);
         if (it != keys.end()) return it->second;
-        throw std::runtime_error("Key not found: " + key);
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Key not found: " + key);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 };
 
 // Load keys from simple INI file
-KeyStore load_keys(const std::string& key_file) {
+KeyStore load_keys(HWND hwnd, const std::string& key_file) {
     KeyStore ks;
     std::ifstream fin(key_file);
     if (!fin) {
-        throw std::runtime_error("Cannot open key file: " + key_file);
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Cannot open key file: " + key_file);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     std::string line;
@@ -446,7 +490,7 @@ KeyStore load_keys(const std::string& key_file) {
         value_str.erase(0, value_str.find_first_not_of(" \t\r\n"));
         value_str.erase(value_str.find_last_not_of(" \t\r\n") + 1);
 
-        std::vector<uint8_t> value = hex_to_bytes(value_str);
+        std::vector<uint8_t> value = hex_to_bytes(hwnd, value_str);
 
         // Handle titlekek separately
         if (key.find("titlekek") == 0) {
@@ -518,6 +562,7 @@ void aes_ecb_encrypt_block(const std::array<uint8_t, 16>& key,
 }
 
 std::vector<uint8_t> aes_xts_decrypt(
+    HWND hwnd, 
     const std::vector<uint8_t>& data,
     const std::vector<uint8_t>& key,
     uint64_t base_sector = 0,
@@ -525,7 +570,10 @@ std::vector<uint8_t> aes_xts_decrypt(
 ) {
     // Check that the key is 32 bytes (for AES-256-XTS)
     if (key.size() != 32) {
-        throw std::runtime_error("Header key must be 32 bytes (256 bits)");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Header key must be 32 bytes (256 bits)");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     // Initialize the cipher context
@@ -534,12 +582,18 @@ std::vector<uint8_t> aes_xts_decrypt(
 
     // Setup AES cipher for AES-128-XTS
     if (mbedtls_cipher_setup(&ctx, mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_XTS)) != 0) {
-        throw std::runtime_error("Failed to set up AES-XTS cipher context");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to set up AES-XTS cipher context");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     // Set the key (first part of AES-XTS key)
     if (mbedtls_cipher_setkey(&ctx, key.data(), 256, MBEDTLS_DECRYPT) != 0) {
-        throw std::runtime_error("Failed to set key1 for AES-XTS");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to set key1 for AES-XTS");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     // Prepare output vector
@@ -553,18 +607,32 @@ std::vector<uint8_t> aes_xts_decrypt(
         std::array<uint8_t, 16> tweak =
             nintendo_tweak(base_sector + sector_index);
 
-        if (mbedtls_cipher_set_iv(&ctx, tweak.data(), 16) != 0)
-            throw std::runtime_error("cipher_set_iv failed");
+        if (mbedtls_cipher_set_iv(&ctx, tweak.data(), 16) != 0) {
+            ShowError(hwnd, StrBuilder{} << "[FATAL] cipher_set_iv failed");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
+        }
 
-        if (mbedtls_cipher_reset(&ctx) != 0)
-            throw std::runtime_error("cipher_reset failed");
+        if (mbedtls_cipher_reset(&ctx) != 0) {
+            ShowError(hwnd, StrBuilder{} << "[FATAL] cipher_reset failed");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
+        }
 
         size_t block_size;
         if (mbedtls_cipher_update(&ctx, data.data() + sector_offset, sector_size, out.data() + sector_offset, &block_size) != 0) {
-            throw std::runtime_error("Failed to decrypt AES-XTS block");
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to decrypt AES-XTS block");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
         if (block_size != sector_size) {
-            throw std::runtime_error("Failed to decrypt AES-XTS block");
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to decrypt AES-XTS block");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
     }
 
@@ -574,13 +642,16 @@ std::vector<uint8_t> aes_xts_decrypt(
     return out;
 }
 
-std::vector<uint8_t> aes_128_ecb_decrypt(const std::vector<uint8_t>& key, const std::vector<uint8_t>& data) {
+std::vector<uint8_t> aes_128_ecb_decrypt(HWND hwnd, const std::vector<uint8_t>& key, const std::vector<uint8_t>& data) {
     mbedtls_aes_context aes_ctx;
     mbedtls_aes_init(&aes_ctx);
 
     // Set AES decryption key
     if (mbedtls_aes_setkey_dec(&aes_ctx, key.data(), 128) != 0) {
-        throw std::runtime_error("AES key setup failed");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] AES key setup failed");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     std::vector<uint8_t> decrypted_data(data.size());
@@ -589,7 +660,10 @@ std::vector<uint8_t> aes_128_ecb_decrypt(const std::vector<uint8_t>& key, const 
     // Decrypt in blocks of 16 bytes (AES block size)
     while (offset < data.size()) {
         if (mbedtls_aes_crypt_ecb(&aes_ctx, MBEDTLS_AES_DECRYPT, data.data() + offset, decrypted_data.data() + offset) != 0) {
-            throw std::runtime_error("AES decryption failed");
+            ShowError(hwnd, StrBuilder{} << "[FATAL] AES decryption failed");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
         offset += 16;
     }
@@ -640,7 +714,7 @@ int get_master_key_index(uint8_t keygen) {
     return keygen - 1;
 }
 
-std::vector<uint8_t> get_key_area_key(const KeyStore& keys, const NcaHeader& nca_header) {
+std::vector<uint8_t> get_key_area_key(HWND hwnd, const KeyStore& keys, const NcaHeader& nca_header) {
     int keygen = get_master_key_index(nca_header.keygen); // Get keygen index
 
     // Build the master key name
@@ -652,7 +726,10 @@ std::vector<uint8_t> get_key_area_key(const KeyStore& keys, const NcaHeader& nca
     ;
     std::string master_key_name = ss.str();
     if (keys.keys.find(master_key_name) == keys.keys.end()) {
-        throw std::runtime_error("Missing " + master_key_name);
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing " + master_key_name);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& master_key = keys.keys.at(master_key_name);
 
@@ -669,34 +746,46 @@ std::vector<uint8_t> get_key_area_key(const KeyStore& keys, const NcaHeader& nca
         src_name = "key_area_key_system_source";
         break;
     default:
-        throw std::runtime_error("Invalid key_area_key_index: " + std::to_string(nca_header.key_area_key_index));
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid key_area_key_index: " + std::to_string(nca_header.key_area_key_index));
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     if (keys.keys.find(src_name) == keys.keys.end()) {
-        throw std::runtime_error("Missing " + src_name);
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing " + src_name);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& key_area_src = keys.keys.at(src_name);
 
     if (keys.keys.find("aes_kek_generation_source") == keys.keys.end()) {
-        throw std::runtime_error("Missing aes_kek_generation_source");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing aes_kek_generation_source");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& aes_kek_src = keys.keys.at("aes_kek_generation_source");
 
     if (keys.keys.find("aes_key_generation_source") == keys.keys.end()) {
-        throw std::runtime_error("Missing aes_key_generation_source");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing aes_key_generation_source");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& aes_keygen_src = keys.keys.at("aes_key_generation_source");
 
     // Decrypt using AES in ECB mode
-    std::vector<uint8_t> kek = aes_128_ecb_decrypt(master_key, aes_kek_src);
-    std::vector<uint8_t> keygen_key = aes_128_ecb_decrypt(kek, key_area_src);
-    std::vector<uint8_t> key_area_key = aes_128_ecb_decrypt(keygen_key, aes_keygen_src);
+    std::vector<uint8_t> kek = aes_128_ecb_decrypt(hwnd, master_key, aes_kek_src);
+    std::vector<uint8_t> keygen_key = aes_128_ecb_decrypt(hwnd, kek, key_area_src);
+    std::vector<uint8_t> key_area_key = aes_128_ecb_decrypt(hwnd, keygen_key, aes_keygen_src);
 
     return key_area_key;
 }
 
 // Retrieve the Title KEK for a given NCA
-std::vector<uint8_t> get_title_kek_key(const KeyStore& keys, const NcaHeader& nca_header) {
+std::vector<uint8_t> get_title_kek_key(HWND hwnd, const KeyStore& keys, const NcaHeader& nca_header) {
     int keygen = get_master_key_index(nca_header.keygen); // Get keygen index
 
     // Build the master key name
@@ -708,15 +797,21 @@ std::vector<uint8_t> get_title_kek_key(const KeyStore& keys, const NcaHeader& nc
     ;
     std::string master_key_name = ss.str();
     if (keys.keys.find(master_key_name) == keys.keys.end()) {
-        throw std::runtime_error("Missing " + master_key_name);
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing " + master_key_name);
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& master_key = keys.keys.at(master_key_name);
 
     if (keys.keys.find("titlekek_source") == keys.keys.end()) {
-        throw std::runtime_error("Missing titlekek_source");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Missing titlekek_source");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
     const std::vector<uint8_t>& title_kek_src = keys.keys.at("titlekek_source");
-    std::vector<uint8_t> title_kek = aes_128_ecb_decrypt(master_key, title_kek_src);
+    std::vector<uint8_t> title_kek = aes_128_ecb_decrypt(hwnd, master_key, title_kek_src);
     return title_kek;
 }
 
@@ -746,9 +841,9 @@ bool is_nsp_file(const std::string& path) {
     return std::string(magic, 4) == "PFS0";
 }
 
-std::vector<uint8_t> transcode_data(const std::vector<uint8_t>& data, const std::vector<uint8_t>& key) {
+std::vector<uint8_t> transcode_data(HWND hwnd, const std::vector<uint8_t>& data, const std::vector<uint8_t>& key) {
     // Use aes_128_ecb_decrypt for transcoding (decryption in this case)
-    return aes_128_ecb_decrypt(key, data);
+    return aes_128_ecb_decrypt(hwnd, key, data);
 }
 
 std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, const NcaFsHeader & section, const KeyStore& keys) {
@@ -776,15 +871,15 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
             return {};
         }
 
-        std::vector<uint8_t> kek_key = get_title_kek_key(keys, nca_header);
-        std::vector<uint8_t> dec_key_area = transcode_data(it->second, kek_key);
+        std::vector<uint8_t> kek_key = get_title_kek_key(hwnd, keys, nca_header);
+        std::vector<uint8_t> dec_key_area = transcode_data(hwnd, it->second, kek_key);
 
         return dec_key_area;
     }
 
     // Get the key area key
-    std::vector<uint8_t> key_area_key = get_key_area_key(keys, nca_header);
-    std::vector<uint8_t> dec_key_area = transcode_data(nca_header.key_area, key_area_key);
+    std::vector<uint8_t> key_area_key = get_key_area_key(hwnd, keys, nca_header);
+    std::vector<uint8_t> dec_key_area = transcode_data(hwnd, nca_header.key_area, key_area_key);
 
     // Split the decrypted key area into key slots (each 16 bytes)
     std::vector<std::vector<uint8_t>> keyslots(4);
@@ -973,7 +1068,10 @@ void ctr_ex_crypt(
             buf.data(),
             chunk))
         {
-            throw std::runtime_error("CTR-EX read failed");
+            ShowError(hwnd, StrBuilder{} << "[FATAL] CTR-EX read failed");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
         }
         readpos += chunk;
 
@@ -1009,10 +1107,6 @@ void ctr_ex_crypt(
             << std::hex << (buf.size())
             << " bytes at 0x" << (physical_offset + processed)
             << std::dec << "\n");
-        if ((physical_offset + processed) == 0x2e25b740)
-        {
-            __debugbreak();
-        }
         out.write(reinterpret_cast<char*>(buf.data()), chunk);
         processed += chunk;
     }
@@ -1140,8 +1234,12 @@ void decrypt_aes_ctr_ex_section(
         uint64_t ctr_ex_size = patch.aes_ctr_ex_size;
 
         std::vector<uint8_t> ctr_ex_data(ctr_ex_size);
-        if (!read_at(physical_base + ctr_ex_offset, reinterpret_cast<char*>(ctr_ex_data.data()), ctr_ex_size))
-            throw std::runtime_error("CTR-EX table short read");
+        if (!read_at(physical_base + ctr_ex_offset, reinterpret_cast<char*>(ctr_ex_data.data()), ctr_ex_size)) {
+            ShowError(hwnd, StrBuilder{} << "[FATAL] CTR-EX table short read");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
+        }
 
         std::array<uint8_t, 4> secure4;
         std::copy_n(section.SecureValue.begin(), 4, secure4.begin());
@@ -1172,8 +1270,12 @@ void decrypt_aes_ctr_ex_section(
         uint64_t indirect_size = patch.indirect_size;
 
         std::vector<uint8_t> indirect_data(indirect_size);
-        if (!read_at(physical_base + indirect_offset, reinterpret_cast<char*>(indirect_data.data()), indirect_size))
-            throw std::runtime_error("Indirect table short read");
+        if (!read_at(physical_base + indirect_offset, reinterpret_cast<char*>(indirect_data.data()), indirect_size)) {
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Indirect table short read");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
+        }
 
         std::array<uint8_t, 4> secure4;
         std::copy_n(section.SecureValue.begin(), 4, secure4.begin());
@@ -1330,8 +1432,12 @@ void decrypt_pfs0_file_inplace(
         // --- read aligned encrypted data ---
         std::vector<uint8_t> enc(aligned_size);
 
-        if (!read_at(aligned_start, reinterpret_cast<char*>(enc.data()), aligned_size))
-            throw std::runtime_error("Short read during aligned decrypt");
+        if (!read_at(aligned_start, reinterpret_cast<char*>(enc.data()), aligned_size)) {
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Short read during aligned decrypt");
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return;
+        }
 
         // --- decrypt ---
         std::vector<uint8_t> dec =
@@ -1365,7 +1471,7 @@ void decrypt_partition_table(
     uint64_t section_offset = entry.start * 0x200ULL;
     uint64_t section_size = (entry.end - entry.start) * 0x200ULL;
     uint64_t abs_offset = nca_offset + section_offset;
-    uint64_t hash_region_size = section.hash_region_size();
+    uint64_t hash_region_size = section.hash_region_size(hwnd);
 
     LogMessage(hwnd, StrBuilder{} << "        [*] Decrypting PartitionFS @ 0x"
         << std::hex << abs_offset
@@ -1376,7 +1482,10 @@ void decrypt_partition_table(
         return;
     }
     else if (section.encryption_type != 3) {
-        throw std::runtime_error("PartitionFS encryption type not supported");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] PartitionFS encryption type not supported");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
     }
 
     auto content_key = get_content_key(hwnd, nca_header, section, keys);
@@ -1393,7 +1502,10 @@ void decrypt_partition_table(
     LogMessage(hwnd, StrBuilder{} << "            FS magic: " << magic << "\n");
 
     if (magic != "PFS0" && magic != "HFS0") {
-        throw std::runtime_error("Invalid PartitionFS magic");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid PartitionFS magic");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
     }
 
     uint32_t file_count = read_u32_le(dec.data() + 0x04);
@@ -1416,7 +1528,11 @@ void decrypt_partition_table(
     fout.write(reinterpret_cast<char*>(dec_meta.data()), dec_meta.size());
 
     if (magic == "HFS0") {
-        throw std::runtime_error("Unhandled partitionFS magic HFS0");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Unhandled partitionFS magic HFS0");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return;
+
     }
 
     const auto& buf = dec_meta;
@@ -1500,7 +1616,7 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
         }
 
         std::vector<uint8_t> header_bytes(header.begin(), header.end());
-        auto dec = aes_xts_decrypt(header_bytes, header_key, 0);
+        auto dec = aes_xts_decrypt(hwnd, header_bytes, header_key, 0);
         nca_header = parse_nca_header(dec);
 
         std::string new_magic(nca_header.magic, 4);
@@ -1545,7 +1661,7 @@ void decrypt_nca(HWND hwnd, std::fstream& fout, const Partition& partition, KeyS
             << " end=0x" << entry.end
             << " size=0x" << (entry.end - entry.start) << "\n");
 
-        NcaFsHeader section = parse_nca_fs_header(std::vector<char>(header.begin() + fs_header_offset, header.begin() + fs_header_offset + 0x200));
+        NcaFsHeader section = parse_nca_fs_header(hwnd, std::vector<char>(header.begin() + fs_header_offset, header.begin() + fs_header_offset + 0x200));
         if (section.fs_type == 0) {
             decrypt_romfs(hwnd, fout, nca_offset, nca_header, section, i, keys);
         }
@@ -1571,7 +1687,10 @@ std::vector<Partition> parse_hfs0_partitions(HWND hwnd, uint64_t hfs0_offset) {
     read_at(hfs0_offset, magic, 4);
 
     if (std::string(magic, 4) != "HFS0") {
-        throw std::runtime_error("Invalid HFS0 magic at offset " + std::to_string(hfs0_offset));
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid HFS0 magic at offset " + std::to_string(hfs0_offset));
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     uint32_t file_count;
@@ -1954,15 +2073,21 @@ bool convert_nsp(HWND hwnd,
     if (fs::exists(output_path)) {
         if (!overwrite)
         {
-            throw std::runtime_error(
-                "Output file already exists: " + output_path.string());
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Output file already exists: " + output_path.string());
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
 
         fs::remove(output_path);
     }
     fs::create_directories(output_dir);
-    if (!LoadFileToMemory(input_path, hwnd))
-        throw std::runtime_error("Failed to open NSP");
+    if (!LoadFileToMemory(input_path, hwnd)) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to open NSP");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
     SaveFileWithProgress(hwnd, output_path);
     if (g_cancel_decrypt)
     {
@@ -1971,15 +2096,23 @@ bool convert_nsp(HWND hwnd,
 
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
-    if (!fout)
-        throw std::runtime_error("Failed to open NSP outpur");
+    if (!fout) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to open NSP output");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     // Parse root PFS0
     char magic[4];
     read_at(0, magic, 4);
 
-    if (std::string(magic, 4) != "PFS0")
-        throw std::runtime_error("Invalid NSP");
+    if (std::string(magic, 4) != "PFS0") {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid NSP");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     uint32_t file_count;
     uint32_t string_table_size;
@@ -2086,16 +2219,22 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
     if (fs::exists(output_path)) {
         if (!overwrite)
         {
-            throw std::runtime_error(
-                "Output file already exists: " + output_path.string());
+            ShowError(hwnd, StrBuilder{} << "[FATAL] Output file already exists: " + output_path.string());
+            g_decrypt_failed = true;
+            g_cancel_decrypt = true;
+            return {};
         }
 
         fs::remove(output_path);
     }
 
     fs::create_directories(output_dir);
-    if (!LoadFileToMemory(input_path, hwnd))
-        throw std::runtime_error("Failed to open input file.");
+    if (!LoadFileToMemory(input_path, hwnd)) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to open input file.");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
     SaveFileWithProgress(hwnd,output_path);
     if (g_cancel_decrypt)
     {
@@ -2105,14 +2244,22 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
 
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
-    if (!fout) throw std::runtime_error("Failed to open output file.");
+    if (!fout) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Failed to open output file.");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
+    }
 
     // Verify HEAD magic
     char magic[4];
     read_at(0x100, magic, 4);
 
     if (std::string(magic, 4) != "HEAD") {
-        throw std::runtime_error("Invalid XCI magic number.");
+        ShowError(hwnd, StrBuilder{} << "[FATAL] Invalid XCI magic number.");
+        g_decrypt_failed = true;
+        g_cancel_decrypt = true;
+        return {};
     }
 
     // Read HFS0 offset/size
@@ -2188,8 +2335,10 @@ bool convert_file(HWND hwnd, const std::string& input_path, const std::string& o
     if (is_nsp_file(input_path)) {
         return convert_nsp(hwnd, input_path, output_dir, name, keys, overwrite);
     }
-
-    throw std::runtime_error("Unsupported file type. Only valid XCI files are supported.");
+    ShowError(hwnd, StrBuilder{} << "[FATAL] Unsupported file type. Only valid XCI files are supported.");
+    g_decrypt_failed = true;
+    g_cancel_decrypt = true;
+    return false;
 }
 
 #define WM_CONVERT_DONE     (WM_APP + 1)
@@ -2252,7 +2401,7 @@ DWORD WINAPI ConvertThread(LPVOID param)
     g_decrypt_failed = false;
     try
     {
-        KeyStore ks = load_keys(ctx->key_file);
+        KeyStore ks = load_keys(ctx->hwnd, ctx->key_file);
 
         if (convert_file(
             ctx->hwnd,
