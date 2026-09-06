@@ -792,22 +792,17 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
         keyslots[i] = std::vector<uint8_t>(dec_key_area.begin() + i * 16, dec_key_area.begin() + (i + 1) * 16);
     }
 
-    // Find the non-zero key slot (there should be exactly one)
-    std::vector<std::pair<int, std::vector<uint8_t>>> non_zero;
-    for (int i = 0; i < 4; ++i) {
-        if (std::any_of(keyslots[i].begin(), keyslots[i].end(), [](uint8_t b) { return b != 0; })) {
-            non_zero.push_back({ i, keyslots[i] });
-        }
-    }
-
-    if (non_zero.size() != 1) {
-        ShowError(hwnd, StrBuilder{} << "[FATAL] Expected exactly 1 content key, found " << non_zero.size() << "\n");
+    switch (section.encryption_type) {
+    case 3: // AesCtr
+        return keyslots[2];
+    case 4: // AesCtrEx
+    default:
+        ShowError(hwnd, StrBuilder{} << "[FATAL] get_content_key: Unknown encryption type: "
+            << int(section.encryption_type) << "\n");
         g_decrypt_failed = true;
         g_cancel_decrypt = true;
         return {};
     }
-
-    return non_zero[0].second;  // Return the content key (the only non-zero key)
 }
 
 void decrypt_aes_ctr_section(
