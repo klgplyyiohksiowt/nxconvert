@@ -707,15 +707,13 @@ std::vector<uint8_t> aes_ctr_decrypt(const std::vector<uint8_t>& enc, const std:
     mbedtls_aes_free(&aes);
     return out;
 }
-int get_master_key_index(uint8_t keygen) {
-    if (keygen <= 2) {
-        return keygen;
-    }
-    return keygen - 1;
+
+int get_master_key_index(uint8_t KeyGenerationOld, uint8_t KeyGeneration) {
+    return std::max(std::max(KeyGenerationOld, KeyGeneration), static_cast<uint8_t>(1)) - 1;
 }
 
 std::vector<uint8_t> get_key_area_key(HWND hwnd, const KeyStore& keys, const NcaHeader& nca_header) {
-    int keygen = get_master_key_index(nca_header.keygen); // Get keygen index
+    int keygen = get_master_key_index(nca_header.keygen_old, nca_header.keygen); // Get keygen index
 
     // Build the master key name
     std::ostringstream ss;
@@ -786,7 +784,7 @@ std::vector<uint8_t> get_key_area_key(HWND hwnd, const KeyStore& keys, const Nca
 
 // Retrieve the Title KEK for a given NCA
 std::vector<uint8_t> get_title_kek_key(HWND hwnd, const KeyStore& keys, const NcaHeader& nca_header) {
-    int keygen = get_master_key_index(nca_header.keygen); // Get keygen index
+    int keygen = get_master_key_index(nca_header.keygen_old, nca_header.keygen); // Get keygen index
 
     // Build the master key name
     std::ostringstream ss;
